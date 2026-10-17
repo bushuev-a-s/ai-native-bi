@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+# Данные организаторов в публичный репозиторий не кладём!
+data/
+private_data/
+*.sqlite

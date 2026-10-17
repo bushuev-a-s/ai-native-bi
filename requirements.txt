@@ -1,0 +1,7 @@
+streamlit>=1.35,<1.50
+pandas>=2.0
+numpy
+sqlalchemy>=2.0
+psycopg2-binary
+plotly>=5.20
+requests
