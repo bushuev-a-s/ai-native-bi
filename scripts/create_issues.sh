@@ -5,7 +5,6 @@ set -euo pipefail
 mk() { gh issue create --title "$1" --body "$2" --label "$3" >/dev/null && echo "+ $1"; }
 for l in P0 P1 P2 agent data ui analytics org; do gh label create "$l" --force >/dev/null 2>&1 || true; done
 
-mk "Отправить письмо организаторам" "Шаблон: docs/EMAIL.md. Срок 17.10 18:00" "P0,org"
 mk "Задать вопросы менторам, записать ответы" "docs/MENTORS.md" "P0,org"
 mk "Каждый запускает проект у себя и описывает ошибки" "README, быстрый старт" "P0,org"
 mk "Выбрать модель под железо, проверить скорость" "LLM_* в .env" "P0,agent"
