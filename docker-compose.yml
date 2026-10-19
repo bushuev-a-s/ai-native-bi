@@ -12,16 +12,26 @@ services:
       test: ["CMD-SHELL", "pg_isready -U bi"]
       interval: 5s
       retries: 10
+    networks:
+      - bi-network
 
   ollama:
-    image: ollama/ollama
+    image: ollama/ollama:latest
     ports: ["11434:11434"]
     volumes: [ollama:/root/.ollama]
-    # Для NVIDIA GPU раскомментируйте:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 5s
+      retries: 10
+    networks:
+      - bi-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   app:
     build: .
@@ -31,13 +41,23 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434}
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
       LLM_API_KEY: ${LLM_API_KEY:-not-needed}
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
     ports: ["8501:8501"]
+    volumes:
+      - .:/app
+      - /app/.venv
     depends_on:
       db:
         condition: service_healthy
       ollama:
-        condition: service_started
+        condition: service_healthy
+    networks:
+      - bi-network
 
 volumes:
   pgdata:
   ollama:
+
+networks:
+  bi-network:
+    driver: bridge
