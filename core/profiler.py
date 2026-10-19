@@ -10,6 +10,7 @@ import pandas as pd
 
 from . import config
 from .loader import _try_dates
+from .analytics import analyze_unknown_csv
 
 ID_NAME_RE = re.compile(r"(^|_)(id|uuid|guid|key|код)($|_)|id$", re.I)
 
@@ -112,8 +113,32 @@ def profile_table(db, table: str) -> dict:
     }
 
 
+GENERIC_KEY_NAMES = {"id", "index", "idx", "n", "no", "num", "number", "rowid", "row_id"}
+
+
+def _stem(table: str) -> str:
+    """users -> user, payments -> payment, categories -> category."""
+    t = table.lower()
+    if t.endswith("ies") and len(t) > 4:
+        return t[:-3] + "y"
+    if t.endswith("sses"):
+        return t[:-2]
+    if t.endswith("s") and not t.endswith("ss") and len(t) > 2:
+        return t[:-1]
+    return t
+
+
+def _name_link(ta: str, ca: str, tb: str, cb: str) -> bool:
+    """Есть ли у пары колонок смысловая подсказка в названиях.
+    Одних совпадающих значений мало: любые два ряда 1..N совпадают на 100%, но это не связь."""
+    a, b = ca.lower(), cb.lower()
+    if a == b:
+        return a not in GENERIC_KEY_NAMES                         # user_id = user_id, но не id = id
+    return b in (f"{_stem(ta)}_id", f"{_stem(ta)}id") or a in (f"{_stem(tb)}_id", f"{_stem(tb)}id")
+
+
 def find_relations(db, profiles: list[dict], min_overlap: float = 0.3) -> list[dict]:
-    """Связи между таблицами: пересечение значений ключевых колонок."""
+    """Связи между таблицами: ключевые колонки, у которых совпадают И названия-подсказки, И значения."""
     sets: dict[tuple[str, str], set] = {}
     for p in profiles:
         for c in p["columns"]:
@@ -128,7 +153,7 @@ def find_relations(db, profiles: list[dict], min_overlap: float = 0.3) -> list[d
     rels, keys = [], list(sets)
     for i, (ta, ca) in enumerate(keys):
         for tb, cb in keys[i + 1:]:
-            if ta == tb:
+            if ta == tb or not _name_link(ta, ca, tb, cb):
                 continue
             a, b = sets[(ta, ca)], sets[(tb, cb)]
             inter = len(a & b)
@@ -139,7 +164,40 @@ def find_relations(db, profiles: list[dict], min_overlap: float = 0.3) -> list[d
 
 
 def profile_all(db) -> tuple[list[dict], list[dict]]:
-    profiles = [profile_table(db, t) for t in db.tables()]
+
+    tables = db.tables()
+    profiles = []
+    
+    for table_name in tables:
+        # 1. Базовый профиль для LLM и связей
+        df_sample = db.query(f'SELECT * FROM "{table_name}"', max_rows=config.PROFILE_SAMPLE_ROWS)
+        types = dict(db.columns(table_name))
+        cols = [profile_column(c, types.get(c, " "), df_sample[c]) for c in df_sample.columns]
+        
+        time_cols = [c for c in cols if c["kind"] == "datetime"]
+        main_time = max(time_cols, key=lambda c: c["n_unique"]) if time_cols else None
+        
+        base_profile = {
+            "name": table_name,
+            "rows": db.row_count(table_name),
+            "n_cols": len(cols),
+            "sampled": db.row_count(table_name) > len(df_sample),
+            "duplicate_rows": int(df_sample.duplicated().sum()),
+            "time_col": main_time["name"] if main_time else None,
+            "period_from": main_time["min"] if main_time else None,
+            "period_to": main_time["max"] if main_time else None,
+            "columns": cols,
+        }
+        
+        # 2. Расширенный анализ (аномалии, сезонность и т.д.)
+        # Берем полную выборку или сэмпл для тяжелых вычислений
+        df_full = db.query(f"SELECT * FROM {table_name}") 
+        extended_analysis = analyze_unknown_csv(df_full)
+        
+        # Объединяем в один профиль
+        full_profile = {**base_profile, "analysis": extended_analysis}
+        profiles.append(full_profile)
+
     return profiles, find_relations(db, profiles)
 
 
