@@ -72,6 +72,29 @@ def render_message(m: dict, idx: int):
         if m.get("sql"):
             with st.expander("Как посчитано (SQL)"):
                 st.code(m["sql"], language="sql")
+        if m.get("analysis"):
+            with st.expander("📊 Детальный анализ данных"):
+                a = m["analysis"]
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Дубликаты строк", a["duplicates"]["duplicate_rows"])
+                    st.metric("Столбцов с аномалиями", len(a["anomalies"]))
+                    
+                with col2:
+                    if a.get("seasonality", {}).get("is_seasonal"):
+                        st.success("✅ Обнаружена сезонность")
+                    else:
+                        st.info("⚪ Сезонность не выражена")
+                        
+                if a["correlations"].get("strong_pairs"):
+                    st.subheader("🔗 Сильные корреляции")
+                    for pair in a["correlations"]["strong_pairs"]:
+                        st.caption(f"`{pair['col1']}` ↔ `{pair['col2']}` : **{pair['correlation']}**")
+                        
+                if a.get("lags", {}).get("values"):
+                    st.subheader("⏳ Автокорреляция (Лаги)")
+                    st.json(a["lags"]["values"])
 
 
 # ------------------------------------------------------------------ боковая панель
@@ -98,6 +121,9 @@ with st.sidebar:
         ss.messages = []
         if ss.agent:
             ss.agent.last = None
+    if st.button(" Обновить глубокий анализ"):
+        refresh_agent()
+        st.rerun()
 
     if ss.agent is None and db.tables():
         refresh_agent()
