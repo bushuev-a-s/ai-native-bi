@@ -1,3 +1,7 @@
+from __future__ import annotations
+from . import config
+
+from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, List
@@ -128,14 +132,6 @@ def analyze_unknown_csv(df: pd.DataFrame) -> Dict[str, Any]:
   - df — таблица результата; chart — спецификация графика как в core/charts.py (или None);
   - новый инструмент добавляется в TOOLS с описанием — по нему агент будет выбирать инструмент.
 Подключение к агенту (новое намерение "analyze" в core/agent.py) — отдельная задача."""
-from __future__ import annotations
-
-from dataclasses import dataclass
-
-import pandas as pd
-
-from . import config
-
 
 @dataclass
 class AnalysisResult:
