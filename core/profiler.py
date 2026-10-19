@@ -10,6 +10,7 @@ import pandas as pd
 
 from . import config
 from .loader import _try_dates
+from .analytics import analyze_unknown_csv
 
 ID_NAME_RE = re.compile(r"(^|_)(id|uuid|guid|key|код)($|_)|id$", re.I)
 
@@ -163,7 +164,40 @@ def find_relations(db, profiles: list[dict], min_overlap: float = 0.3) -> list[d
 
 
 def profile_all(db) -> tuple[list[dict], list[dict]]:
-    profiles = [profile_table(db, t) for t in db.tables()]
+
+    tables = db.tables()
+    profiles = []
+    
+    for table_name in tables:
+        # 1. Базовый профиль для LLM и связей
+        df_sample = db.query(f'SELECT * FROM "{table_name}"', max_rows=config.PROFILE_SAMPLE_ROWS)
+        types = dict(db.columns(table_name))
+        cols = [profile_column(c, types.get(c, " "), df_sample[c]) for c in df_sample.columns]
+        
+        time_cols = [c for c in cols if c["kind"] == "datetime"]
+        main_time = max(time_cols, key=lambda c: c["n_unique"]) if time_cols else None
+        
+        base_profile = {
+            "name": table_name,
+            "rows": db.row_count(table_name),
+            "n_cols": len(cols),
+            "sampled": db.row_count(table_name) > len(df_sample),
+            "duplicate_rows": int(df_sample.duplicated().sum()),
+            "time_col": main_time["name"] if main_time else None,
+            "period_from": main_time["min"] if main_time else None,
+            "period_to": main_time["max"] if main_time else None,
+            "columns": cols,
+        }
+        
+        # 2. Расширенный анализ (аномалии, сезонность и т.д.)
+        # Берем полную выборку или сэмпл для тяжелых вычислений
+        df_full = db.query(f"SELECT * FROM {table_name}") 
+        extended_analysis = analyze_unknown_csv(df_full)
+        
+        # Объединяем в один профиль
+        full_profile = {**base_profile, "analysis": extended_analysis}
+        profiles.append(full_profile)
+
     return profiles, find_relations(db, profiles)
 
 
