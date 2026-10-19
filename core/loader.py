@@ -119,6 +119,27 @@ def _clean_chunk(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def table_name_from_file(filename: str) -> str:
+    stem = re.sub(r"\.[^.]+$", "", filename)
+    return clean_names([stem])[0]
+
+
+# ---------------------------------------------------------------- большие файлы: потоковая загрузка через COPY
+# Существующие функции выше не менялись. Это отдельная функция для файлов, которые не стоит читать целиком.
+
+def _clean_chunk(df: pd.DataFrame) -> pd.DataFrame:
+    """Та же очистка колонок, что в read_csv_smart, но для одного чанка."""
+    df.columns = clean_names(df.columns)
+    for col in df.columns:
+        if df[col].dtype == object or pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].map(lambda v: v.strip() if isinstance(v, str) else v)
+            df[col] = df[col].replace("", pd.NA)
+            df[col] = _try_decimal_comma(df[col])
+            if not pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = _try_dates(df[col])
+    return df
+
+
 def _pg_type(dtype) -> str:
     if pd.api.types.is_bool_dtype(dtype):
         return "BOOLEAN"
@@ -131,6 +152,26 @@ def _pg_type(dtype) -> str:
     return "TEXT"
 
 
+def _coerce_like(df: pd.DataFrame, dtypes: dict) -> pd.DataFrame:
+    """Приводим чанк к типам первого чанка, чтобы COPY не падал из-за «поплывшего» типа."""
+    for col, dt in dtypes.items():
+        s = df[col]
+        if s.dtype == dt:
+            continue
+        if pd.api.types.is_bool_dtype(dt):
+            continue
+        if pd.api.types.is_integer_dtype(dt):
+            df[col] = pd.to_numeric(s, errors="coerce").round().astype("Int64")
+        elif pd.api.types.is_float_dtype(dt):
+            if not pd.api.types.is_numeric_dtype(s):
+                s = s.astype("object").map(lambda v: v.replace(",", ".") if isinstance(v, str) else v)
+            df[col] = pd.to_numeric(s, errors="coerce")
+        elif pd.api.types.is_datetime64_any_dtype(dt):
+            if not pd.api.types.is_datetime64_any_dtype(s):
+                df[col] = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        else:
+            df[col] = s.astype("object").where(s.isna(), s.astype(str))
+    return df
 # Порядок «расширения» типа колонки, если в поздних чанках встретились значения, не влезающие в тип первого чанка.
 _WIDEN = {"BIGINT": "DOUBLE PRECISION", "DOUBLE PRECISION": "TEXT", "TIMESTAMP": "TEXT", "BOOLEAN": "TEXT"}
 
@@ -227,6 +268,7 @@ def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000) -
     """Грузит большой CSV в Postgres через COPY кусками. Требует psycopg2.
 
     source: путь, bytes или файловый объект. Таблица пересоздаётся.
+    Всё в одной транзакции: при ошибке на середине таблицы не останется. Возвращает число строк.
     Типы берутся из первого чанка; если в поздних чанках встречаются значения другого типа, колонка расширяется
     (ALTER TYPE), данные не теряются. Всё в одной транзакции: при ошибке таблицы не останется.
     Возвращает число строк.
