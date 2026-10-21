@@ -15,16 +15,19 @@ services:
     networks:
       - bi-network
 
-  ollama:
+  ollama-gpu:
     image: ollama/ollama:latest
     ports: ["11434:11434"]
     volumes: [ollama:/root/.ollama]
+    entrypoint: [ "/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull qwen2.5:7b-instruct && wait" ]
     healthcheck:
       test: ["CMD-SHELL", "ollama list || exit 1"]
       interval: 5s
       retries: 10
     networks:
-      - bi-network
+      bi-network:
+        aliases:
+          - ollama
     deploy:
       resources:
         reservations:
@@ -33,12 +36,28 @@ services:
               count: all
               capabilities: [gpu]
 
+  ollama-cpu:
+    image: ollama/ollama:latest
+    ports: ["11435:11434"]
+    volumes: [ollama:/root/.ollama]
+    entrypoint: [ "/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull qwen2.5:7b-instruct && wait" ]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 5s
+      retries: 10
+    networks:
+      bi-network:
+        aliases:
+          - ollama
+    profiles:
+      - cpu
+
   app:
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg2://bi:bi@db:5432/bi
       LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama-gpu:11434}
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
       LLM_API_KEY: ${LLM_API_KEY:-not-needed}
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
@@ -49,8 +68,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      ollama:
+      ollama-cpu:
         condition: service_healthy
+        required: false
+      ollama-gpu:
+        condition: service_healthy
+        required: false
     networks:
       - bi-network
 
