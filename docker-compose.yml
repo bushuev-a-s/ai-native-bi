@@ -15,7 +15,7 @@ services:
     networks:
       - bi-network
 
-  ollama:
+  ollama-gpu:
     image: ollama/ollama:latest
     ports: ["11434:11434"]
     volumes: [ollama:/root/.ollama]
@@ -24,7 +24,9 @@ services:
       interval: 5s
       retries: 10
     networks:
-      - bi-network
+      bi-network:
+        aliases:
+          - ollama
     deploy:
       resources:
         reservations:
@@ -32,6 +34,21 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  ollama-cpu:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes: [ollama:/root/.ollama]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 5s
+      retries: 10
+    networks:
+      bi-network:
+        aliases:
+          - ollama
+    profiles:
+      - cpu
 
   app:
     build: .
@@ -49,8 +66,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      ollama:
+      ollama-cpu:
         condition: service_healthy
+        required: false
+      ollama-gpu:
+        condition: service_healthy
+        required: false
     networks:
       - bi-network
 
