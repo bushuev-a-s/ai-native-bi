@@ -9,5 +9,6 @@ else
     echo "[INFO] GPU не обнаружен или драйверы не установлены. Запуск в режиме CPU..."
     
     # Запускаем CPU-сценарий (сервис ollama-gpu будет проигнорирован)
+    LLM_BASE_URL=http://ollama-cpu:11434
     docker compose --profile cpu up -d
 fi

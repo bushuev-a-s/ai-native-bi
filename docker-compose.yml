@@ -19,6 +19,7 @@ services:
     image: ollama/ollama:latest
     ports: ["11434:11434"]
     volumes: [ollama:/root/.ollama]
+    entrypoint: [ "/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull qwen2.5:7b-instruct && wait" ]
     healthcheck:
       test: ["CMD-SHELL", "ollama list || exit 1"]
       interval: 5s
@@ -37,8 +38,9 @@ services:
 
   ollama-cpu:
     image: ollama/ollama:latest
-    ports: ["11434:11434"]
+    ports: ["11435:11434"]
     volumes: [ollama:/root/.ollama]
+    entrypoint: [ "/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull qwen2.5:7b-instruct && wait" ]
     healthcheck:
       test: ["CMD-SHELL", "ollama list || exit 1"]
       interval: 5s
@@ -55,7 +57,7 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg2://bi:bi@db:5432/bi
       LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama-gpu:11434}
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
       LLM_API_KEY: ${LLM_API_KEY:-not-needed}
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
