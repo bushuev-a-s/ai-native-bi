@@ -1,4 +1,11 @@
 # Всё локально: PostgreSQL + Ollama (LLM) + приложение. Внешние сервисы не нужны.
+#
+# Запуск:  bash run.sh   (сам выберет профиль gpu или cpu)
+# Вручную: docker compose --profile gpu up -d --build    или    docker compose --profile cpu up -d --build
+# Если используете чужую модель по API (ключ организаторов), профиль не нужен:
+#          LLM_PROVIDER=openai LLM_BASE_URL=... LLM_MODEL=... LLM_API_KEY=... docker compose up -d --build
+#
+# Приложение обращается к модели по имени «ollama»: его носит и ollama-gpu, и ollama-cpu, переключать адрес не нужно.
 services:
   db:
     image: postgres:16
@@ -12,22 +19,28 @@ services:
       test: ["CMD-SHELL", "pg_isready -U bi"]
       interval: 5s
       retries: 10
-    networks:
-      - bi-network
+    networks: [bi-network]
 
   ollama-gpu:
     image: ollama/ollama:latest
+    profiles: ["gpu"]
     ports: ["11434:11434"]
     volumes: [ollama:/root/.ollama]
-    entrypoint: [ "/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull qwen2.5:7b-instruct && wait" ]
+    environment:
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+    entrypoint: ["/bin/sh", "-c"]
+    # Ждём, пока сервер реально поднимется (а не фиксированные 5 секунд), качаем модель;
+    # если скачать не вышло (нет сети), сервер всё равно остаётся работать с тем, что уже есть.
+    command:
+      - |
+        ollama serve & pid=$$!
+        until ollama list >/dev/null 2>&1; do sleep 1; done
+        ollama pull "$$LLM_MODEL" || echo "[WARN] не удалось скачать $$LLM_MODEL, используем уже скачанные модели"
+        wait $$pid
     healthcheck:
-      test: ["CMD-SHELL", "ollama list || exit 1"]
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
       interval: 5s
-      retries: 10
-    networks:
-      bi-network:
-        aliases:
-          - ollama
+      retries: 20
     deploy:
       resources:
         reservations:
@@ -35,47 +48,55 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    networks:
+      bi-network:
+        aliases: [ollama]
 
   ollama-cpu:
     image: ollama/ollama:latest
-    ports: ["11435:11434"]
+    profiles: ["cpu"]
+    ports: ["11434:11434"]
     volumes: [ollama:/root/.ollama]
-    entrypoint: [ "/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull qwen2.5:7b-instruct && wait" ]
+    environment:
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve & pid=$$!
+        until ollama list >/dev/null 2>&1; do sleep 1; done
+        ollama pull "$$LLM_MODEL" || echo "[WARN] не удалось скачать $$LLM_MODEL, используем уже скачанные модели"
+        wait $$pid
     healthcheck:
-      test: ["CMD-SHELL", "ollama list || exit 1"]
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
       interval: 5s
-      retries: 10
+      retries: 20
     networks:
       bi-network:
-        aliases:
-          - ollama
-    profiles:
-      - cpu
+        aliases: [ollama]
 
   app:
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg2://bi:bi@db:5432/bi
       LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama-gpu:11434}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434}
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
       LLM_API_KEY: ${LLM_API_KEY:-not-needed}
+      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
+      LLM_KEEP_ALIVE: ${LLM_KEEP_ALIVE:-30m}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-300}
+      LLM_EXTRA_PARAMS: ${LLM_EXTRA_PARAMS:-}
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
     ports: ["8501:8501"]
     volumes:
       - .:/app
       - /app/.venv
+    # Приложение зависит только от БД: оно стартует сразу и показывает статус модели
+    # (пока модель скачивается, индикатор красный, потом позеленеет).
     depends_on:
       db:
         condition: service_healthy
-      ollama-cpu:
-        condition: service_healthy
-        required: false
-      ollama-gpu:
-        condition: service_healthy
-        required: false
-    networks:
-      - bi-network
+    networks: [bi-network]
 
 volumes:
   pgdata:
