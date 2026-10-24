@@ -1,0 +1,10 @@
+# Не тащим в образ: чужое окружение, историю и данные организаторов
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.env
+data/
+private_data/
+*.sqlite
