@@ -8,7 +8,7 @@ from core.charts import make_figure
 from core.db import Database
 from core.history import ChatHistory, hydrate, restore_agent_context
 from core.llm import LLMClient
-from core.loader import read_csv_smart, table_name_from_file
+from core.loader import load_file
 from core.profiler import profile_all
 
 st.set_page_config(page_title="AI BI Agent", page_icon="📊", layout="wide")
@@ -168,11 +168,19 @@ with st.sidebar:
     st.divider()
     files = st.file_uploader("Загрузить CSV (сырые данные)", type=["csv"], accept_multiple_files=True)
     if files and st.button("Загрузить в базу", type="primary"):
+        done = []
         for f in files:
-            with st.spinner(f"Загружаю {f.name}…"):
-                db.load_dataframe(read_csv_smart(f), table_name_from_file(f.name))
-        refresh_agent()
-        st.success(f"Загружено файлов: {len(files)}")
+            with st.spinner(f"Загружаю {f.name} ({f.size / 1024 / 1024:.1f} МБ)…"):
+                try:
+                    table, rows, method = load_file(db, f, f.name, size=f.size)
+                except Exception as e:  # noqa: BLE001 — один плохой файл не должен останавливать остальные
+                    st.error(f"{f.name}: не удалось загрузить — {str(e)[:200]}")
+                    continue
+            done.append(f"• **{table}** — {rows:,} строк".replace(",", " ")
+                        + (" (быстрая загрузка COPY)" if method == "copy" else ""))
+        if done:
+            refresh_agent()
+            st.success("Загружено:\n\n" + "\n".join(done))
     if st.button("Обновить профиль данных"):
         refresh_agent()
     if st.button(" Обновить глубокий анализ"):
