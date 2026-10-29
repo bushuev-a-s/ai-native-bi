@@ -1,0 +1,366 @@
+diff --git a/app.py b/app.py
+index afb7350..2fa1f06 100644
+--- a/app.py
++++ b/app.py
+@@ -64,6 +64,15 @@ def delete_chat(chat_id: int):
+         new_chat()
+ 
+ 
++def drop_table(name: str):
++    try:
++        get_db().drop_table(name)
++        ss.agent = None                      # профиль и связи пересчитаются при следующей перерисовке
++        st.toast(f"Таблица «{name}» удалена")
++    except Exception as e:  # noqa: BLE001
++        st.toast(f"Не удалось удалить «{name}»: {str(e)[:100]}", icon="⚠️")
++
++
+ def delete_dashboard(dash_id: int):
+     get_db().delete_dashboard(dash_id)
+ 
+@@ -166,21 +175,32 @@ with st.sidebar:
+                        help="Удалить чат")
+ 
+     st.divider()
++    SEP_CHOICES = {"Авто": None, "Запятая ( , )": ",", "Точка с запятой ( ; )": ";",
++                   "Табуляция": "\t", "Вертикальная черта ( | )": "|"}
++    sep_label = st.selectbox("Разделитель в CSV", list(SEP_CHOICES),
++                             help="Обычно определяется автоматически. Если таблица загрузилась «кашей» или с одной "
++                                  "колонкой, удалите её, выберите разделитель вручную и загрузите файл заново.")
+     files = st.file_uploader("Загрузить CSV (сырые данные)", type=["csv"], accept_multiple_files=True)
+     if files and st.button("Загрузить в базу", type="primary"):
+-        done = []
++        done, warn = [], []
+         for f in files:
+             with st.spinner(f"Загружаю {f.name} ({f.size / 1024 / 1024:.1f} МБ)…"):
+                 try:
+-                    table, rows, method = load_file(db, f, f.name, size=f.size)
++                    table, rows, method = load_file(db, f, f.name, size=f.size, sep=SEP_CHOICES[sep_label])
+                 except Exception as e:  # noqa: BLE001 — один плохой файл не должен останавливать остальные
+                     st.error(f"{f.name}: не удалось загрузить — {str(e)[:200]}")
+                     continue
+-            done.append(f"• **{table}** — {rows:,} строк".replace(",", " ")
++            n_cols = len(db.columns(table))
++            done.append(f"• **{table}** — {rows:,}".replace(",", " ") + f" строк, колонок: {n_cols}"
+                         + (" (быстрая загрузка COPY)" if method == "copy" else ""))
++            if n_cols == 1:
++                warn.append(f"«{table}»: всего одна колонка, возможно, разделитель определён неверно. "
++                            "Удалите таблицу, выберите разделитель вручную и загрузите файл заново.")
+         if done:
+             refresh_agent()
+             st.success("Загружено:\n\n" + "\n".join(done))
++        for w in warn:
++            st.warning(w)
+     if st.button("Обновить профиль данных"):
+         refresh_agent()
+     if st.button(" Обновить глубокий анализ"):
+@@ -193,7 +213,12 @@ with st.sidebar:
+         st.divider()
+         st.caption("Таблицы в базе")
+         for p in ss.agent.profiles:
+-            st.write(f"• **{p['name']}** — {p['rows']:,} строк".replace(",", " "))
++            c_name, c_del = st.columns([5, 1])
++            c_name.write(f"• **{p['name']}** — {p['rows']:,} строк".replace(",", " "))
++            with c_del.popover("🗑"):
++                st.write(f"Удалить таблицу **{p['name']}** вместе с данными? Это нельзя отменить.")
++                st.button("Да, удалить", type="primary", key=f"tbl-del-{p['name']}",
++                          on_click=drop_table, args=(p["name"],))
+ 
+ # ------------------------------------------------------------------ вкладки
+ tab_chat, tab_dash = st.tabs(["💬 Чат с аналитиком", "📈 Дашборды"])
+diff --git a/core/db.py b/core/db.py
+index 88c8354..e2a1928 100644
+--- a/core/db.py
++++ b/core/db.py
+@@ -65,13 +65,20 @@ class Database:
+         chunk = max(1, min(5000, 30000 // max(1, len(df.columns))))
+         df.to_sql(table, self.engine, if_exists="replace", index=False,
+                   chunksize=chunk, method="multi")
+-    def load_csv(self, source, table: str, chunksize: int = 200_000) -> int:
++    def load_csv(self, source, table: str, chunksize: int = 200_000, sep: str | None = None) -> int:
+         """Быстрая потоковая загрузка CSV через COPY (для больших файлов).
+ 
+         source: путь, bytes или файловый объект. Таблица пересоздаётся, вся загрузка в одной
+         транзакции. Возвращает число загруженных строк.
+         """
+-        return load_csv_to_postgres(source, self.engine, table, chunksize)
++        return load_csv_to_postgres(source, self.engine, table, chunksize, sep)
++
++    def drop_table(self, table: str) -> None:
++        """Удаляет загруженную таблицу. Служебные `_bi_*` и несуществующие имена отклоняются."""
++        if table not in self.tables():
++            raise ValueError(f"Таблицы {table!r} нет среди загруженных данных")
++        with self.engine.begin() as c:
++            c.execute(text('DROP TABLE "' + table.replace('"', '""') + '"'))
+ 
+     # --- запросы (только чтение) -----------------------------------------------
+     def query(self, sql: str, max_rows: int | None = None) -> pd.DataFrame:
+diff --git a/core/loader.py b/core/loader.py
+index 18d6bd9..57035cc 100644
+--- a/core/loader.py
++++ b/core/loader.py
+@@ -2,8 +2,10 @@
+ import codecs
+ import csv
+ import io
++import itertools
+ import os
+ import re
++from collections import Counter
+ import logging
+ import warnings
+ 
+@@ -26,13 +28,36 @@ def _decode(raw: bytes) -> str:
+     return raw.decode("latin-1")
+ 
+ 
++SEPARATORS = ";,\t|"          # при равенстве баллов выигрывает тот, что раньше в списке
++
++
+ def _sniff_sep(text: str) -> str:
+-    sample = text[:20000]
+-    try:
+-        return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+-    except csv.Error:
+-        first = sample.split("\n", 1)[0]
+-        return max(",;\t|", key=first.count)
++    """Определяет разделитель по первым строкам файла.
++
++    Для каждого кандидата файл разбирается csv-парсером (кавычки учитываются), и считается, у какой доли
++    строк одинаковое число полей. Побеждает разделитель, дающий самую ровную таблицу, при равенстве
++    больше колонок. Так `;` с десятичной запятой (`1,5`) и запятые внутри текста не сбивают выбор.
++    Если ни один не даёт 2+ колонок (файл из одной колонки), возвращается запятая.
++    """
++    sample = text[:65536]
++    truncated = len(text) > len(sample)
++    best, best_key = ",", (0.0, 0)
++    for d in SEPARATORS:
++        try:
++            rows = [r for r in itertools.islice(csv.reader(io.StringIO(sample), delimiter=d), 300) if r]
++        except csv.Error:
++            continue
++        if truncated and len(rows) > 2:
++            rows = rows[:-1]                      # последняя строка выборки могла быть обрезана
++        if not rows:
++            continue
++        k, cnt = max(Counter(len(r) for r in rows).items(), key=lambda kv: (kv[1], kv[0]))
++        if k < 2:
++            continue
++        key = (round(cnt / len(rows), 3), k)
++        if key > best_key:
++            best, best_key = d, key
++    return best
+ 
+ 
+ def clean_names(columns) -> list[str]:
+@@ -84,8 +109,8 @@ def _try_dates(s: pd.Series) -> pd.Series:
+     return s
+ 
+ 
+-def read_csv_smart(source) -> pd.DataFrame:
+-    """source: путь, bytes или файловый объект (st.file_uploader)."""
++def read_csv_smart(source, sep: str | None = None) -> pd.DataFrame:
++    """source: путь, bytes или файловый объект (st.file_uploader). sep: разделитель (None — определить сам)."""
+     if isinstance(source, str):
+         with open(source, "rb") as f:
+             raw = f.read()
+@@ -94,7 +119,7 @@ def read_csv_smart(source) -> pd.DataFrame:
+     else:
+         raw = source.read()
+     text = _decode(raw)
+-    sep = _sniff_sep(text)
++    sep = sep or _sniff_sep(text)
+     df = pd.read_csv(io.StringIO(text), sep=sep, low_memory=False)
+     return _clean_chunk(df)
+ 
+@@ -265,7 +290,7 @@ def _detect_encoding(data) -> str:
+     return "latin-1"
+ 
+ 
+-def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000) -> int:
++def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000, sep: str | None = None) -> int:
+     """Грузит большой CSV в Postgres через COPY кусками. Требует psycopg2.
+ 
+     source: путь, bytes или файловый объект. Таблица пересоздаётся.
+@@ -282,7 +307,7 @@ def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000) -
+         raw = source if isinstance(source, bytes) else source.read()
+         data, head = io.BytesIO(raw), raw[: 1 << 20]
+     enc = _detect_encoding(data)
+-    sep = _sniff_sep(head.decode(enc, errors="ignore"))
++    sep = sep or _sniff_sep(head.decode(enc, errors="ignore"))
+     if hasattr(data, "seek"):
+         data.seek(0)
+ 
+@@ -319,7 +344,7 @@ def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000) -
+ 
+ 
+ def load_file(db, source, filename: str, size: int | None = None,
+-              threshold_mb: float | None = None) -> tuple[str, int, str]:
++              threshold_mb: float | None = None, sep: str | None = None) -> tuple[str, int, str]:
+     """Грузит CSV в базу, выбирая способ по размеру файла.
+ 
+     Файл от порога (FAST_LOAD_MIN_MB, по умолчанию 50 МБ) идёт потоково через COPY (`db.load_csv`),
+@@ -339,7 +364,8 @@ def load_file(db, source, filename: str, size: int | None = None,
+     if hasattr(source, "seek"):
+         source.seek(0)
+     if size is not None and size >= limit:
+-        return table, db.load_csv(source, table), "copy"
+-    df = read_csv_smart(source)
++        kw = {"sep": sep} if sep else {}
++        return table, db.load_csv(source, table, **kw), "copy"
++    df = read_csv_smart(source, sep=sep)
+     db.load_dataframe(df, table)
+     return table, len(df), "dataframe"
+diff --git a/tests/test_sniff.py b/tests/test_sniff.py
+new file mode 100644
+index 0000000..56c1e1b
+--- /dev/null
++++ b/tests/test_sniff.py
+@@ -0,0 +1,147 @@
++"""Запуск: python -m tests.test_sniff. Определение разделителя CSV и удаление таблицы (без Postgres)."""
++import sys
++import types
++
++from core.loader import _sniff_sep, load_file, read_csv_smart
++
++try:
++    import sqlalchemy  # noqa: F401
++except ImportError:                                    # окружение без SQLAlchemy: подставляем заглушку для импорта core.db
++    stub = types.ModuleType("sqlalchemy")
++    stub.create_engine = stub.inspect = None
++    stub.text = lambda s: s
++    sys.modules["sqlalchemy"] = stub
++from core.db import Database  # noqa: E402
++
++
++def test_basic_separators():
++    assert _sniff_sep("a,b,c\n1,2,3\n4,5,6\n") == ","
++    assert _sniff_sep("a;b;c\n1;2;3\n4;5;6\n") == ";"
++    assert _sniff_sep("a\tb\tc\n1\t2\t3\n") == "\t"
++    assert _sniff_sep("a|b|c\n1|2|3\n") == "|"
++
++
++def test_semicolon_with_decimal_comma():
++    """Десятичная запятая не должна перебивать точку с запятой."""
++    text = "id;сумма;город\n1;1,5;Москва\n2;22,75;Тверь\n3;3;Казань\n4;4,25;Омск\n"
++    assert _sniff_sep(text) == ";"
++
++
++def test_semicolon_with_commas_in_every_text_value():
++    text = "имя;комментарий\n" + "".join(f"u{i};хорошо, но дорого\n" for i in range(20))
++    assert _sniff_sep(text) == ";"
++
++
++def test_comma_with_semicolons_inside_quotes():
++    text = 'id,note,x\n1,"a;b;c",5\n2,"d;e",6\n3,"f;g;h;i",7\n'
++    assert _sniff_sep(text) == ","
++
++
++def test_comma_file_with_free_text_containing_semicolon():
++    text = "id,text,n\n" + "".join(f"{i},a;b;c;d,{i}\n" for i in range(10))
++    assert _sniff_sep(text) == ","
++
++
++def test_first_line_is_not_decisive():
++    """Заголовок с запятой в названии колонки (в кавычках) и данные через ;."""
++    text = '"Сумма, руб";"Город"\n10;Москва\n20;Тверь\n30;Омск\n'
++    assert _sniff_sep(text) == ";"
++
++
++def test_title_lines_above_the_table_do_not_decide():
++    """Выгрузки из 1С/Excel: над таблицей строки-«шапка» с запятыми. Прежний алгоритм (csv.Sniffer) тут ошибался."""
++    rows = "".join(f"{i};текст;{i},5\n" if i % 3 == 0 else f"{i};текст;{i}\n" for i in range(30))
++    text = "Отчёт о продажах, 2024\nСформирован: 01.02.2024, автор: Иванов\nid;t;n\n" + rows
++    assert _sniff_sep(text) == ";"
++    tab = "Отчёт, 2024\nid\tp\tq\n" + "".join(f"{i}\ta, b\tc\n" for i in range(30))
++    assert _sniff_sep(tab) == "\t"
++
++
++def test_ragged_rows_with_title_line():
++    """Часть строк с лишним полем + строка-заголовок отчёта: берём разделитель, дающий самую ровную таблицу."""
++    rows = "".join(f"{i};a;b" + (";c" if i % 7 == 0 else "") + "\n" for i in range(40))
++    assert _sniff_sep("Итоги, за год\nid;p;q\n" + rows) == ";"
++
++
++def test_excel_sep_hint_line():
++    assert _sniff_sep("sep=;\nid;t\n1;a\n2;b\n") == ";"
++
++
++def test_single_column_falls_back_to_comma():
++    assert _sniff_sep("name\nAnna\nBoris\n") == ","
++    assert _sniff_sep("") == ","
++
++
++def test_truncated_sample_does_not_break_choice():
++    row = "1;абв,где;3\n"
++    text = "a;b;c\n" + row * 20000                     # длиннее выборки: последняя строка выборки обрезана
++    assert _sniff_sep(text) == ";"
++
++
++def test_manual_separator_overrides_detection():
++    data = "a;b\n1;2\n".encode()
++    assert list(read_csv_smart(data).columns) == ["a", "b"]
++    assert list(read_csv_smart(data, sep=",").columns) == ["a_b"]      # принудительно «не тот» — ровно то, что просили
++
++
++def test_load_file_passes_sep_only_when_given():
++    calls = []
++
++    class DB:
++        def load_csv(self, source, table, *a, **kw):
++            calls.append(kw)
++            return 1
++
++    db, data = DB(), b"a;b\n1;2\n"
++    load_file(db, data, "t.csv", threshold_mb=0.000001)
++    load_file(db, data, "t.csv", threshold_mb=0.000001, sep=";")
++    assert calls == [{}, {"sep": ";"}]
++
++
++class _Conn:
++    def __init__(self, log):
++        self.log = log
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *a):
++        return False
++
++    def execute(self, sql, *a):
++        self.log.append(str(sql))
++
++
++class _Engine:
++    def __init__(self):
++        self.log = []
++
++    def begin(self):
++        return _Conn(self.log)
++
++
++def _db(tables):
++    db = Database.__new__(Database)
++    db.engine, db.tables = _Engine(), (lambda: tables)
++    return db
++
++
++def test_drop_table_only_drops_loaded_tables():
++    db = _db(["users", "events"])
++    db.drop_table("users")
++    assert db.engine.log == ['DROP TABLE "users"']
++    for bad in ("_bi_chats", "_bi_dashboards", 'users"; DROP TABLE events; --', "нет_такой"):
++        try:
++            db.drop_table(bad)
++        except ValueError:
++            continue
++        raise AssertionError(f"удалилось лишнее: {bad}")
++    assert db.engine.log == ['DROP TABLE "users"']
++
++
++if __name__ == "__main__":
++    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
++    for t in tests:
++        t()
++        print("PASS", t.__name__)
++    print(f"\nВсе тесты sniff пройдены: {len(tests)}")
