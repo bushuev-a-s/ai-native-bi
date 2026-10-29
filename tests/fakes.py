@@ -52,6 +52,6 @@ class ScriptedLLM:
         self.replies = list(replies)
         self.calls = []
 
-    def chat(self, messages, temperature=0.0, json_mode=False):
+    def chat(self, messages, temperature=0.0, json_mode=False, max_tokens=None):
         self.calls.append(messages)
         return self.replies.pop(0)

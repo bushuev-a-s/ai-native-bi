@@ -6,6 +6,7 @@ from sqlalchemy import create_engine, inspect, text
 
 from . import config
 from . import config
+from . import cache
 from .loader import load_csv_to_postgres
 
 META_PREFIX = "_bi_"
@@ -52,13 +53,17 @@ class Database:
         chunk = max(1, min(5000, 30000 // max(1, len(df.columns))))
         df.to_sql(table, self.engine, if_exists="replace", index=False,
                   chunksize=chunk, method="multi")
+        cache.bump()
+
     def load_csv(self, source, table: str, chunksize: int = 200_000) -> int:
         """Быстрая потоковая загрузка CSV через COPY (для больших файлов).
 
         source: путь, bytes или файловый объект. Таблица пересоздаётся, вся загрузка в одной
         транзакции. Возвращает число загруженных строк.
         """
-        return load_csv_to_postgres(source, self.engine, table, chunksize)
+        n = load_csv_to_postgres(source, self.engine, table, chunksize)
+        cache.bump()
+        return n
 
     # --- запросы (только чтение) -----------------------------------------------
     def query(self, sql: str, max_rows: int | None = None) -> pd.DataFrame:

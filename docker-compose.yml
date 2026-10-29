@@ -1,11 +1,17 @@
-# Всё локально: PostgreSQL + Ollama (LLM) + приложение. Внешние сервисы не нужны.
+# PostgreSQL + приложение + (по желанию) локальная модель Ollama.
 #
-# Запуск:  bash run.sh   (сам выберет профиль gpu или cpu)
-# Вручную: docker compose --profile gpu up -d --build    или    docker compose --profile cpu up -d --build
-# Если используете чужую модель по API (ключ организаторов), профиль не нужен:
-#          LLM_PROVIDER=openai LLM_BASE_URL=... LLM_MODEL=... LLM_API_KEY=... docker compose up -d --build
+# Два режима работы модели:
 #
-# Приложение обращается к модели по имени «ollama»: его носит и ollama-gpu, и ollama-cpu, переключать адрес не нужно.
+#  A) Модель организаторов или любой внешний OpenAI-совместимый сервер (основной режим для проверки).
+#     В .env задаются LLM_BASE_URL (с /v1), LLM_MODEL, LLM_API_KEY, затем:
+#         docker compose up -d --build            (профиль не нужен, Ollama не запускается)
+#
+#  B) Локальная модель в контейнере Ollama. Оставьте LLM_BASE_URL незаданным и запустите с профилем:
+#         docker compose --profile gpu up -d --build     (есть NVIDIA)
+#         docker compose --profile cpu up -d --build     (без видеокарты, медленно)
+#     Приложение обращается к модели по имени «ollama» (его носят оба сервиса): http://ollama:11434/v1
+#
+# Проще всего запускать через:  bash run.sh   (сам выберет режим)
 services:
   db:
     image: postgres:16
@@ -28,9 +34,13 @@ services:
     volumes: [ollama:/root/.ollama]
     environment:
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+      # Через /v1 размер контекста и время хранения модели нельзя задать в запросе, поэтому задаём на сервере.
+      # (Названия переменных зависят от версии Ollama: если эффекта нет, проверьте логи `docker compose logs ollama-gpu`.)
+      OLLAMA_CONTEXT_LENGTH: ${LLM_NUM_CTX:-8192}
+      OLLAMA_KEEP_ALIVE: ${LLM_KEEP_ALIVE:-30m}
     entrypoint: ["/bin/sh", "-c"]
     # Ждём, пока сервер реально поднимется (а не фиксированные 5 секунд), качаем модель;
-    # если скачать не вышло (нет сети), сервер всё равно остаётся работать с тем, что уже есть.
+    # если скачать не вышло (нет сети), сервер всё равно работает с тем, что уже есть.
     command:
       - |
         ollama serve & pid=$$!
@@ -59,6 +69,8 @@ services:
     volumes: [ollama:/root/.ollama]
     environment:
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+      OLLAMA_CONTEXT_LENGTH: ${LLM_NUM_CTX:-8192}
+      OLLAMA_KEEP_ALIVE: ${LLM_KEEP_ALIVE:-30m}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -78,21 +90,28 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg2://bi:bi@db:5432/bi
-      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
       LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
       LLM_API_KEY: ${LLM_API_KEY:-not-needed}
-      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
-      LLM_KEEP_ALIVE: ${LLM_KEEP_ALIVE:-30m}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-300}
       LLM_EXTRA_PARAMS: ${LLM_EXTRA_PARAMS:-}
+      # Только для LLM_PROVIDER=ollama (родной API):
+      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
+      LLM_KEEP_ALIVE: ${LLM_KEEP_ALIVE:-30m}
+      # Скорость и поведение агента (значения по умолчанию заданы в core/config.py):
+      ROUTER_MODE: ${ROUTER_MODE:-rules}
+      NARRATION: ${NARRATION:-auto}
+      HISTORY_TURNS: ${HISTORY_TURNS:-4}
+      SQL_MAX_TOKENS: ${SQL_MAX_TOKENS:-1024}
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
     ports: ["8501:8501"]
     volumes:
       - .:/app
       - /app/.venv
     # Приложение зависит только от БД: оно стартует сразу и показывает статус модели
-    # (пока модель скачивается, индикатор красный, потом позеленеет).
+    # (пока локальная модель скачивается, индикатор красный, потом позеленеет).
     depends_on:
       db:
         condition: service_healthy

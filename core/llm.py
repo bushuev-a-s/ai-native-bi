@@ -1,12 +1,17 @@
-"""Клиент LLM. Поддерживает Ollama и любой OpenAI-совместимый сервер (vLLM, LM Studio, llama.cpp, облачный ключ организаторов).
-Провайдер и модель задаются только настройками — жюри подключит свою модель.
+"""Клиент LLM. По умолчанию OpenAI-совместимый API (модель организаторов по ключу, vLLM, LM Studio, llama.cpp,
+локальный Ollama через /v1). Родной API Ollama тоже поддерживается (LLM_PROVIDER=ollama).
+Провайдер, адрес, модель и ключ задаются только настройками — код менять не нужно.
 
-Дополнительные переменные окружения (все необязательные):
-  LLM_NUM_CTX=8192            размер контекста (Ollama)
-  LLM_KEEP_ALIVE=30m          сколько держать модель в памяти между запросами (Ollama): без этого большая модель перезагружается
+Основные переменные: LLM_PROVIDER, LLM_BASE_URL (для openai обычно заканчивается на /v1), LLM_MODEL, LLM_API_KEY.
+
+Дополнительные (необязательные):
+  LLM_MAX_TOKENS=2048         лимит длины ответа (отправляется, только если задан; нужен серверам с маленьким лимитом по умолчанию)
   LLM_TIMEOUT=300             таймаут запроса, секунды
   LLM_EXTRA_PARAMS={"...":..} JSON, который добавляется в тело запроса как есть (например отключение «размышлений» у Qwen:
                               {"chat_template_kwargs": {"enable_thinking": false}} для vLLM или {"think": false} для Ollama)
+  Только для LLM_PROVIDER=ollama:
+  LLM_NUM_CTX=8192            размер контекста
+  LLM_KEEP_ALIVE=30m          сколько держать модель в памяти между запросами
 """
 import json
 import os
@@ -35,17 +40,23 @@ def strip_thinking(text: str) -> str:
     return text.strip()
 
 
-def _check(r) -> None:
+def _check(r, provider: str = "openai") -> None:
     """Понятная ошибка вместо голого «404 Not Found»: показываем ответ сервера и подсказку."""
     if r.status_code < 400:
         return
     body = (getattr(r, "text", "") or "").strip()[:300]
     hint = ""
     if r.status_code == 404:
-        hint = (" Скорее всего, модель не скачана на сервере: выполните `ollama pull <модель>` "
-                "или задайте LLM_MODEL именем из `ollama list`.")
+        if provider == "ollama":
+            hint = (" Скорее всего, модель не скачана на сервере: выполните `ollama pull <модель>` "
+                    "или задайте LLM_MODEL именем из `ollama list`.")
+        else:
+            hint = (" Проверьте LLM_BASE_URL (обычно заканчивается на /v1) и LLM_MODEL. "
+                    "Для локального Ollama модель должна быть скачана (`ollama pull <модель>`).")
     elif r.status_code in (401, 403):
         hint = " Проверьте LLM_API_KEY."
+    elif r.status_code == 429:
+        hint = " Превышен лимит запросов к модели: подождите и повторите."
     raise LLMError(f"HTTP {r.status_code}: {body}{hint}")
 
 
@@ -62,6 +73,9 @@ class LLMClient:
         self.api_key = api_key or config.LLM_API_KEY
         if self.provider not in ("ollama", "openai"):
             raise ValueError("LLM_PROVIDER должен быть 'ollama' или 'openai'")
+        if self.provider == "ollama" and self.base_url.endswith("/v1"):
+            self.base_url = self.base_url[:-3]          # у родного API Ollama путь без /v1
+        self.max_tokens = int(os.getenv("LLM_MAX_TOKENS") or 0) or None
         self.num_ctx = int(os.getenv("LLM_NUM_CTX", "8192"))
         self.keep_alive = os.getenv("LLM_KEEP_ALIVE", "30m")
         self.timeout = int(os.getenv("LLM_TIMEOUT", "300"))
@@ -73,42 +87,47 @@ class LLMClient:
             raise ValueError("LLM_EXTRA_PARAMS должен быть JSON-объектом, например {\"think\": false}") from e
 
     # ------------------------------------------------------------------ чат
-    def chat(self, messages: list[dict], temperature: float = 0.0, json_mode: bool = False) -> str:
+    def chat(self, messages: list[dict], temperature: float = 0.0, json_mode: bool = False,
+             max_tokens: int | None = None) -> str:
         try:
             if self.provider == "ollama":
-                text = self._chat_ollama(messages, temperature, json_mode)
+                text = self._chat_ollama(messages, temperature, json_mode, max_tokens)
             else:
-                text = self._chat_openai(messages, temperature, json_mode)
+                text = self._chat_openai(messages, temperature, json_mode, max_tokens)
             return strip_thinking(text)
         except LLMError:
             raise
         except Exception as e:  # noqa: BLE001
             raise LLMError(f"Модель недоступна ({self.base_url}): {e}") from e
 
-    def _chat_ollama(self, messages, temperature, json_mode) -> str:
+    def _chat_ollama(self, messages, temperature, json_mode, max_tokens=None) -> str:
         payload = {"model": self.model, "messages": messages, "stream": False,
                    "keep_alive": self.keep_alive,
                    "options": {"temperature": temperature, "num_ctx": self.num_ctx}}
         if json_mode:
             payload["format"] = "json"
+        if max_tokens or self.max_tokens:
+            payload["options"]["num_predict"] = max_tokens or self.max_tokens
         payload.update(self.extra)
         r = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
-        _check(r)
+        _check(r, self.provider)
         return r.json()["message"]["content"]
 
-    def _chat_openai(self, messages, temperature, json_mode) -> str:
+    def _chat_openai(self, messages, temperature, json_mode, max_tokens=None) -> str:
         headers = {"Authorization": f"Bearer {self.api_key}"}
         payload = {"model": self.model, "messages": messages, "temperature": temperature}
+        if max_tokens or self.max_tokens:
+            payload["max_tokens"] = max_tokens or self.max_tokens      # лимит на вызов важнее общего LLM_MAX_TOKENS
         payload.update(self.extra)
         url = f"{self.base_url}/chat/completions"
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         r = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
-        if r.status_code == 400 and json_mode:
+        if r.status_code in (400, 422) and json_mode:
             # не все серверы знают response_format — повторяем без него, JSON достанем из текста
             payload.pop("response_format")
             r = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
-        _check(r)
+        _check(r, self.provider)
         return r.json()["choices"][0]["message"]["content"]
 
     # ------------------------------------------------------------------ статус
@@ -117,17 +136,17 @@ class LLMClient:
         try:
             if self.provider == "ollama":
                 r = requests.get(f"{self.base_url}/api/tags", timeout=3)
-                _check(r)
+                _check(r, self.provider)
                 names = [m["name"] for m in r.json().get("models", [])]
             else:
                 r = requests.get(f"{self.base_url}/models", timeout=3,
                                  headers={"Authorization": f"Bearer {self.api_key}"})
-                _check(r)
+                _check(r, self.provider)
                 names = [m["id"] for m in r.json().get("data", [])]
             if names and _norm(self.model) not in {_norm(n) for n in names}:
                 return False, (f"модель {self.model} пока не найдена на сервере (есть: {', '.join(names[:5]) or 'ничего'}). "
-                               f"Если запущено через docker compose, модель скачивается при первом запуске: подождите "
-                               f"и обновите страницу. Иначе выполните `ollama pull {self.model}` или задайте LLM_MODEL")
+                               f"Проверьте LLM_MODEL. Если используете локальный Ollama в docker compose, модель скачивается "
+                               f"при первом запуске: подождите и обновите страницу")
             return True, f"{self.model} · {self.provider}"
         except Exception as e:  # noqa: BLE001
             return False, f"сервер модели недоступен: {e}"
