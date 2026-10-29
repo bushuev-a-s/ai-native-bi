@@ -2,6 +2,7 @@
 import codecs
 import csv
 import io
+import os
 import re
 import logging
 import warnings
@@ -315,3 +316,30 @@ def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000) -
     finally:
         conn.close()
     return total
+
+
+def load_file(db, source, filename: str, size: int | None = None,
+              threshold_mb: float | None = None) -> tuple[str, int, str]:
+    """Грузит CSV в базу, выбирая способ по размеру файла.
+
+    Файл от порога (FAST_LOAD_MIN_MB, по умолчанию 50 МБ) идёт потоково через COPY (`db.load_csv`),
+    меньший — через pandas (`db.load_dataframe`). Возвращает (таблица, строк, "copy" | "dataframe").
+    """
+    from . import config
+
+    table = table_name_from_file(filename)
+    if size is None:
+        if isinstance(source, bytes):
+            size = len(source)
+        elif isinstance(source, str):
+            size = os.path.getsize(source)
+        else:
+            size = getattr(source, "size", None)
+    limit = (config.FAST_LOAD_MIN_MB if threshold_mb is None else threshold_mb) * 1024 * 1024
+    if hasattr(source, "seek"):
+        source.seek(0)
+    if size is not None and size >= limit:
+        return table, db.load_csv(source, table), "copy"
+    df = read_csv_smart(source)
+    db.load_dataframe(df, table)
+    return table, len(df), "dataframe"

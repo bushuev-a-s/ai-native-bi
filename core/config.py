@@ -35,3 +35,5 @@ NARRATE_MAX_TOKENS = int(os.getenv("NARRATE_MAX_TOKENS", "220"))
 OVERVIEW_MAX_TOKENS = int(os.getenv("OVERVIEW_MAX_TOKENS", "300"))
 DASHBOARD_MAX_TOKENS = int(os.getenv("DASHBOARD_MAX_TOKENS", "1600"))
 DASHBOARD_MAX_WIDGETS = int(os.getenv("DASHBOARD_MAX_WIDGETS", "4"))
+# Файлы от этого размера (МБ) грузятся потоково через COPY, меньшие — через pandas
+FAST_LOAD_MIN_MB = float(os.getenv("FAST_LOAD_MIN_MB", "50"))
