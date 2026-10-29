@@ -5,21 +5,34 @@
 Установка зависимостей и проверка ядра (через `uv`, добавил Саня):
 ```bash
 uv sync
-uv run python -m tests.test_core
-uv run python -m tests.test_analytics
-uv run python -m tests.test_loader   # после слияния fix/loader
+bash run_tests.sh              # все тесты сразу (на Windows из Git Bash)
+# по одному: uv run python -m tests.test_core
 ```
 Новая библиотека: `uv add <пакет>`. Не забудьте закоммитить `pyproject.toml` и `uv.lock`.
 
-Полный запуск (нужны Docker для PostgreSQL и модели):
+Полный запуск в Docker:
 ```bash
-docker compose up -d db ollama
-docker compose exec ollama ollama pull qwen2.5:7b-instruct
+cp .env.example .env     # заполнить модель
+bash run.sh              # http://localhost:8501
+```
+`run.sh` выбирает режим по `LLM_BASE_URL`: внешний адрес (модель организаторов) → без Ollama; не задан → Ollama в контейнере
+(`--gpu` / `--cpu` принудительно, `--remote` только БД и приложение).
+
+Запуск приложения без Docker (БД и модель подняты отдельно):
+```bash
+docker compose up -d db
 uv run streamlit run app.py        # http://localhost:8501
 ```
-Приложение по умолчанию ищет БД на `localhost:5432` и модель на `localhost:11434`. Настройки в `.env` (образец `.env.example`).
+По умолчанию провайдер `openai` (OpenAI-совместимый API), БД на `localhost:5432`, модель на `http://localhost:11434/v1`.
+Модель организаторов: в `.env` задать `LLM_BASE_URL` (с `/v1`), `LLM_MODEL`, `LLM_API_KEY`. Все переменные описаны в `.env.example`.
 
 ## Частые проблемы
+
+**Индикатор модели красный.** Текст рядом подскажет причину: неверный `LLM_BASE_URL` (для openai обычно нужен `/v1`), неверное
+имя `LLM_MODEL`, неверный `LLM_API_KEY` (ошибка 401). Если запущена локальная модель в docker compose, при первом запуске она
+скачивается несколько минут: подождите и обновите страницу (`docker compose logs -f ollama-cpu`).
+
+**Ответы обрываются на полуслове.** У некоторых серверов маленький лимит длины ответа по умолчанию: задайте `LLM_MAX_TOKENS=2048`.
 
 **Скрипты `.sh` на Windows: `invalid option name: set: pipefail`.**
 Причина: Git превратил переводы строк в Windows-формат (CRLF). Файл `.gitattributes` из этого обновления это исправляет.
@@ -37,32 +50,10 @@ uv run streamlit run app.py        # http://localhost:8501
 
 ## Docker и uv
 
-В `Dockerfile` из первого варианта зависимости ставятся из `requirements.txt`. Если файл удалили в пользу `pyproject.toml`,
-сборка образа сломается. Два выхода:
-1. Оставить `requirements.txt`, обновляя его командой `uv export --no-hashes -o requirements.txt`.
-2. Переписать `Dockerfile` под `uv`:
-```dockerfile
-FROM python:3.11-slim
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-WORKDIR /app
-COPY pyproject.toml uv.lock ./
-RUN uv sync --no-dev
-COPY . .
-ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
-EXPOSE 8501
-CMD ["uv", "run", "streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]
-```
-Перед этим убедитесь, что `streamlit`, `plotly`, `sqlalchemy`, `psycopg2-binary` есть в `pyproject.toml`.
+`Dockerfile` ставит зависимости через `uv sync --frozen` из `pyproject.toml` и `uv.lock`, `requirements.txt` не нужен.
+После `uv add` / `uv remove` обязательно коммитьте обновлённый `uv.lock`, иначе сборка образа упадёт.
+В образ не попадают `.venv`, `.git`, `.env` и папка `data/` (см. `.dockerignore`).
 
-## Как залить это обновление в репозиторий
+## Как вносить изменения
 
-```bash
-git checkout dev && git pull
-git checkout -b chore/plan-v2
-# распакуйте bi-agent-update.zip в корень репозитория с заменой файлов
-git add --renormalize .
-git add .
-git commit -m "docs: план v2, SETUP, .gitattributes, каркас analytics"
-git push -u origin chore/plan-v2
-```
-Затем Pull Request в `dev`, другой участник нажимает Merge.
+Ветка от `dev` → правки → `bash run_tests.sh` → Pull Request в `dev`. Подробнее в `CONTRIBUTING.md`.

@@ -1,0 +1,5 @@
+[server]
+maxUploadSize = 1024   # МБ; по умолчанию Streamlit режет загрузку на 200 МБ
+
+[browser]
+gatherUsageStats = false

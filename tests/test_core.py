@@ -79,7 +79,6 @@ def test_overview_scenario_1():
 
 def test_query_scenario_2_with_self_repair_and_context():
     agent, llm = _agent([
-        '{"intent": "query", "chart": null}',                                   # роутер
         '```sql\nSELECT planx FROM "users"\n```',                              # неверная колонка
         '```sql\nSELECT "plan" AS "Тариф", COUNT(*) AS "Пользователей" FROM "users" GROUP BY 1\n```',
         "Больше всего пользователей на тарифе basic.",                          # ответ
@@ -87,27 +86,40 @@ def test_query_scenario_2_with_self_repair_and_context():
     r = agent.ask("Сколько пользователей на каждом тарифе?")
     assert r.df is not None and len(r.df) == 3 and "basic" in r.text
     assert r.chart and r.chart["type"] == "bar"                                  # авто-визуализация
-    assert any("Ошибка" in m["content"] for m in llm.calls[2])                  # агент увидел ошибку и исправил
+    assert any("Ошибка" in m["content"] for m in llm.calls[1])                  # агент увидел ошибку и исправил
+    assert len(llm.calls) == 3                                                   # SQL, исправление, пересказ: без вызова маршрутизатора
 
-    # диалог с контекстом: «в другом виде» работает с прошлым результатом
-    llm.replies += ['{"intent": "rechart", "chart_type": "pie"}',
-                    '{"type": "pie", "x": "Тариф", "y": "Пользователей", "title": "Доли тарифов"}']
-    r2 = agent.ask("А теперь покажи то же самое в другом виде")
-    assert r2.chart["type"] == "pie" and r2.df is r.df
+    # диалог с контекстом: «в виде круговой диаграммы» работает с прошлым результатом и не требует вызова модели
+    n = len(llm.calls)
+    r2 = agent.ask("А теперь покажи то же самое в виде круговой диаграммы")
+    assert r2.chart["type"] == "pie" and r2.df is r.df and len(llm.calls) == n
 
 
 def test_unsafe_sql_from_llm_is_blocked_and_clarified():
-    agent, _ = _agent(['{"intent": "query"}'] + ['```sql\nDROP TABLE users\n```'] * 3)
+    agent, _ = _agent(['```sql\nDROP TABLE users\n```'] * 3)
     r = agent.ask("удали пользователей")
     assert r.kind == "clarify"
     assert "users" in agent.db.tables()
 
 
-def test_clarify_and_reject():
-    agent, _ = _agent(['{"intent": "clarify", "message": "За какой период показать?"}',
-                       '{"intent": "reject", "message": "Я не меняю данные."}'])
-    assert agent.ask("покажи динамику").text == "За какой период показать?"
-    assert agent.ask("очисти таблицу").kind == "reject"
+def test_clarify_and_reject_come_from_the_sql_step():
+    agent, _ = _agent(["CLARIFY: За какой период показать?", "REJECT: Я не меняю данные."])
+    r = agent.ask("пokажи динамику")
+    assert r.text == "За какой период показать?", r.text
+    r = agent.ask("очисти таблицу")
+    assert r.kind == "reject" and "не меняю" in r.text
+
+
+def test_llm_router_mode_is_still_available():
+    from core import config
+    old = config.ROUTER_MODE
+    config.ROUTER_MODE = "llm"
+    try:
+        agent, llm = _agent(['{"intent": "clarify", "message": "За какой период показать?"}'])
+        assert agent.ask("покажи динамику").text == "За какой период показать?"
+        assert len(llm.calls) == 1
+    finally:
+        config.ROUTER_MODE = old
 
 
 def test_dashboard_saved_and_reusable():
@@ -115,9 +127,10 @@ def test_dashboard_saved_and_reusable():
             '{"title": "Сумма по статусам", "sql": "SELECT status AS \\"Статус\\", SUM(amount) AS \\"Сумма\\" '
             'FROM payments GROUP BY 1", "chart": {"type": "bar", "x": "Статус", "y": "Сумма"}},'
             '{"title": "Битый виджет", "sql": "SELECT nope FROM payments", "chart": {}}]}')
-    agent, _ = _agent(['{"intent": "dashboard"}', spec, "SELECT nope2 FROM payments"])
+    agent, llm = _agent([spec, "SELECT nope2 FROM payments"])        # дашборд и единственная попытка исправить битый виджет
     r = agent.ask("Создай дашборд по платежам")
     assert r.kind == "dashboard" and len(r.dashboard["widgets"]) == 1       # битый виджет отброшен
+    assert r.widgets and r.widgets[0]["df"] is not None                     # данные уже посчитаны, интерфейсу не нужно считать заново
     saved = agent.db.get_dashboard(r.dashboard_id)
     from core.agent import execute_dashboard
     out = execute_dashboard(agent.db, saved)

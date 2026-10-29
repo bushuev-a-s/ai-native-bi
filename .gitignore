@@ -1,8 +1,12 @@
 __pycache__/
 *.pyc
 .env
+.env.example
 .venv/
 # Данные организаторов в публичный репозиторий не кладём!
 data/
 private_data/
+sample_data/
 *.sqlite
+*.diff
+*.zip

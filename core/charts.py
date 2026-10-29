@@ -28,6 +28,23 @@ def _split(df: pd.DataFrame):
     return time_cols, num, cat
 
 
+def is_time(s: pd.Series) -> bool:
+    return _is_time(s)
+
+
+def guess_axes(df: pd.DataFrame) -> dict | None:
+    """Оси для случая, когда авто-выбор графика ничего не нашёл, а пользователь назвал тип графика."""
+    if df is None or df.empty:
+        return None
+    t, n, c = _split(df)
+    xs = t or c or n
+    if not xs:
+        return None
+    x = xs[0]
+    ys = [col for col in n if col != x]
+    return {"type": "bar", "x": x, "y": ys[0] if ys else None, "color": None, "title": None}
+
+
 def auto_spec(df: pd.DataFrame) -> dict | None:
     if df is None or len(df) < 2 or len(df.columns) < 1:
         return None
