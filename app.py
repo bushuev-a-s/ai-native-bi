@@ -1,6 +1,4 @@
 """Streamlit-интерфейс: чат с агентом + вкладка с сохранёнными дашбордами."""
-import time
-
 import pandas as pd
 import streamlit as st
 
@@ -8,6 +6,7 @@ from core import config
 from core.agent import Agent, execute_dashboard
 from core.charts import make_figure
 from core.db import Database
+from core.history import ChatHistory, hydrate, restore_agent_context
 from core.llm import LLMClient
 from core.loader import read_csv_smart, table_name_from_file
 from core.profiler import profile_all
@@ -25,16 +24,58 @@ def get_llm():
     return LLMClient()
 
 
+@st.cache_resource
+def get_history():
+    return ChatHistory(get_db())
+
+
 db, llm = get_db(), get_llm()
 ss = st.session_state
 ss.setdefault("messages", [])
 ss.setdefault("agent", None)
+ss.setdefault("chat_id", None)       # id открытого чата в БД; None — новый чат (создаётся с первым вопросом)
 
 
 def refresh_agent():
     with st.spinner("Изучаю данные…"):
         profiles, relations = profile_all(db)
     ss.agent = Agent(db, llm, profiles, relations)
+    if ss.messages:                                   # открыт старый чат — вернуть агенту контекст
+        restore_agent_context(ss.agent, ss.messages)
+
+
+# --- история диалогов (callbacks берут историю через get_history(), а не из глобальных переменных) ---
+def new_chat():
+    ss.chat_id, ss.messages = None, []
+    if ss.agent:
+        ss.agent.last = None
+
+
+def open_chat(chat_id: int):
+    ss.chat_id = chat_id
+    ss.messages = hydrate(get_db(), get_history().get_messages(chat_id))   # таблицы пересчитываются по SQL
+    if ss.agent:
+        restore_agent_context(ss.agent, ss.messages)
+
+
+def delete_chat(chat_id: int):
+    get_history().delete_chat(chat_id)
+    if ss.chat_id == chat_id:
+        new_chat()
+
+
+def delete_dashboard(dash_id: int):
+    get_db().delete_dashboard(dash_id)
+
+
+def save_message(role: str, text: str, **extra):
+    """Сохраняет реплику в историю; сбой записи не должен ломать сам диалог."""
+    try:
+        if ss.chat_id is None:
+            ss.chat_id = get_history().create_chat()
+        get_history().add_message(ss.chat_id, role, text, **extra)
+    except Exception as e:  # noqa: BLE001
+        st.toast(f"История не сохранилась: {str(e)[:100]}", icon="⚠️")
 
 
 def render_chart(df: pd.DataFrame, spec: dict | None, key: str):
@@ -46,10 +87,9 @@ def render_chart(df: pd.DataFrame, spec: dict | None, key: str):
             st.dataframe(df, use_container_width=True)
 
 
-def render_dashboard(spec: dict, prefix: str, widgets: list | None = None):
+def render_dashboard(spec: dict, prefix: str):
     st.subheader(spec["title"])
-    # готовые данные из ответа агента или кеш (перерисовка страницы не должна заново гонять запросы по таблице)
-    widgets = widgets or execute_dashboard(db, spec)
+    widgets = execute_dashboard(db, spec)        # данные всегда свежие
     cols = st.columns(2)
     for i, w in enumerate(widgets):
         with cols[i % 2]:
@@ -65,8 +105,11 @@ def render_dashboard(spec: dict, prefix: str, widgets: list | None = None):
 def render_message(m: dict, idx: int):
     with st.chat_message(m["role"]):
         st.markdown(m["text"])
+        if m.get("stale"):
+            st.caption("⚠️ Это сообщение из истории: данные по нему не удалось пересчитать "
+                       "(таблица или дашборд изменились или удалены).")
         if m.get("dashboard"):
-            render_dashboard(m["dashboard"], f"msg{idx}", m.get("widgets"))
+            render_dashboard(m["dashboard"], f"msg{idx}")
         if m.get("chart") is not None and m.get("df") is not None:
             render_chart(m["df"], m["chart"], f"msg{idx}-chart")
         if m.get("df") is not None and not m["df"].empty and not m.get("dashboard"):
@@ -75,9 +118,6 @@ def render_message(m: dict, idx: int):
         if m.get("sql"):
             with st.expander("Как посчитано (SQL)"):
                 st.code(m["sql"], language="sql")
-        if m.get("timing"):
-            t = m["timing"]
-            st.caption(f"⏱ {t['total_s']:.1f} с · вызовов модели: {t['llm_calls']} ({t['llm_s']:.1f} с) · БД: {t['db_s']:.1f} с")
         if m.get("analysis"):
             with st.expander("📊 Детальный анализ данных"):
                 a = m["analysis"]
@@ -113,29 +153,28 @@ with st.sidebar:
         st.error("Нет подключения к БД. Проверьте DATABASE_URL и docker compose up -d db")
         st.stop()
 
+    hist = get_history()
+    st.divider()
+    st.caption("История диалогов")
+    st.button("➕ Новый чат", on_click=new_chat, use_container_width=True)
+    for c in hist.list_chats()[:30]:
+        col_open, col_del = st.columns([5, 1])
+        col_open.button(c["title"], key=f"chat-open-{c['id']}", on_click=open_chat, args=(c["id"],),
+                        use_container_width=True, type="primary" if c["id"] == ss.chat_id else "secondary",
+                        help=f"{c['updated_at'][:16]} · сообщений: {c['messages']}")
+        col_del.button("🗑", key=f"chat-del-{c['id']}", on_click=delete_chat, args=(c["id"],),
+                       help="Удалить чат")
+
     st.divider()
     files = st.file_uploader("Загрузить CSV (сырые данные)", type=["csv"], accept_multiple_files=True)
     if files and st.button("Загрузить в базу", type="primary"):
         for f in files:
-            name, t0 = table_name_from_file(f.name), time.perf_counter()
             with st.spinner(f"Загружаю {f.name}…"):
-                try:
-                    db.load_csv(f, name)               # быстрая загрузка через COPY
-                    how = "COPY"
-                except Exception as e:  # noqa: BLE001
-                    st.warning(f"Быстрая загрузка не удалась ({str(e)[:150]}), использую обычную.")
-                    f.seek(0)
-                    db.load_dataframe(read_csv_smart(f), name)
-                    how = "to_sql"
-            st.caption(f"{f.name}: {time.perf_counter() - t0:.0f} с ({how})")
+                db.load_dataframe(read_csv_smart(f), table_name_from_file(f.name))
         refresh_agent()
         st.success(f"Загружено файлов: {len(files)}")
     if st.button("Обновить профиль данных"):
         refresh_agent()
-    if st.button("Очистить диалог"):
-        ss.messages = []
-        if ss.agent:
-            ss.agent.last = None
     if st.button(" Обновить глубокий анализ"):
         refresh_agent()
         st.rerun()
@@ -160,9 +199,12 @@ with tab_chat:
 
     if prompt := st.chat_input("Задайте вопрос о данных…"):
         ss.messages.append({"role": "user", "text": prompt})
+        save_message("user", prompt)
         render_message(ss.messages[-1], len(ss.messages) - 1)
         if ss.agent is None:
-            res_msg = {"role": "assistant", "text": "Сначала загрузите данные (CSV) в боковой панели."}
+            res_msg = {"role": "assistant", "text": "Сначала загрузите данные (CSV) в боковой панели.",
+                       "kind": "clarify"}
+            save_message("assistant", res_msg["text"], kind="clarify")
         else:
             history = [{"role": m["role"],
                         "content": m["text"] + (f"\n[SQL: {m['sql']}]" if m.get("sql") else "")}
@@ -170,8 +212,9 @@ with tab_chat:
             with st.spinner("Думаю…"):
                 res = ss.agent.ask(prompt, history)
             res_msg = {"role": "assistant", "text": res.text, "sql": res.sql, "df": res.df,
-                       "chart": res.chart, "dashboard": res.dashboard, "widgets": res.widgets,
-                       "timing": res.timing}
+                       "chart": res.chart, "dashboard": res.dashboard, "kind": res.kind}
+            save_message("assistant", res.text, kind=res.kind, sql=res.sql, chart=res.chart,
+                         dashboard_id=res.dashboard_id)
         ss.messages.append(res_msg)
         st.rerun()
 
@@ -184,4 +227,8 @@ with tab_dash:
                               format_func=lambda d: f"#{d['id']} · {d['title']} · {d['created_at']}")
         spec = db.get_dashboard(choice["id"])
         if spec:
+            with st.popover("🗑 Удалить дашборд"):
+                st.write(f"Удалить дашборд «{choice['title']}»? Это действие нельзя отменить.")
+                st.button("Да, удалить", type="primary", key=f"dash-del-{choice['id']}",
+                          on_click=delete_dashboard, args=(choice["id"],))
             render_dashboard(spec, f"saved{choice['id']}")
