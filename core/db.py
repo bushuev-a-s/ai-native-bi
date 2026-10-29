@@ -5,8 +5,6 @@ import pandas as pd
 from sqlalchemy import create_engine, inspect, text
 
 from . import config
-from . import config
-from . import cache
 from .loader import load_csv_to_postgres
 
 META_PREFIX = "_bi_"
@@ -36,6 +34,20 @@ class Database:
         except Exception:  # noqa: BLE001
             return False
 
+    # --- служебные запросы (история чатов и т.п.; агент сюда не попадает) ----------
+    def meta_execute(self, sql: str, params: dict | None = None) -> None:
+        with self.engine.begin() as c:
+            c.execute(text(sql), params or {})
+
+    def meta_insert(self, sql: str, params: dict | None = None) -> int:
+        """INSERT ... и возврат id новой строки."""
+        with self.engine.begin() as c:
+            return int(c.execute(text(sql + " RETURNING id"), params or {}).scalar())
+
+    def meta_fetch(self, sql: str, params: dict | None = None) -> list[dict]:
+        with self.engine.connect() as c:
+            return [dict(r._mapping) for r in c.execute(text(sql), params or {})]
+
     # --- схема -------------------------------------------------------------
     def tables(self) -> list[str]:
         names = inspect(self.engine).get_table_names()
@@ -53,17 +65,13 @@ class Database:
         chunk = max(1, min(5000, 30000 // max(1, len(df.columns))))
         df.to_sql(table, self.engine, if_exists="replace", index=False,
                   chunksize=chunk, method="multi")
-        cache.bump()
-
     def load_csv(self, source, table: str, chunksize: int = 200_000) -> int:
         """Быстрая потоковая загрузка CSV через COPY (для больших файлов).
 
         source: путь, bytes или файловый объект. Таблица пересоздаётся, вся загрузка в одной
         транзакции. Возвращает число загруженных строк.
         """
-        n = load_csv_to_postgres(source, self.engine, table, chunksize)
-        cache.bump()
-        return n
+        return load_csv_to_postgres(source, self.engine, table, chunksize)
 
     # --- запросы (только чтение) -----------------------------------------------
     def query(self, sql: str, max_rows: int | None = None) -> pd.DataFrame:
@@ -89,6 +97,10 @@ class Database:
             rows = c.execute(text(
                 "SELECT id, title, created_at FROM _bi_dashboards ORDER BY id DESC")).fetchall()
         return [{"id": r[0], "title": r[1], "created_at": str(r[2])[:16]} for r in rows]
+
+    def delete_dashboard(self, dash_id: int) -> None:
+        with self.engine.begin() as c:
+            c.execute(text("DELETE FROM _bi_dashboards WHERE id=:i"), {"i": dash_id})
 
     def get_dashboard(self, dash_id: int) -> dict | None:
         with self.engine.connect() as c:

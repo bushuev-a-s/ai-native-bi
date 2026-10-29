@@ -12,6 +12,7 @@
 #     Приложение обращается к модели по имени «ollama» (его носят оба сервиса): http://ollama:11434/v1
 #
 # Проще всего запускать через:  bash run.sh   (сам выберет режим)
+name: ai-native-bi
 services:
   db:
     image: postgres:16
