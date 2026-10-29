@@ -65,13 +65,20 @@ class Database:
         chunk = max(1, min(5000, 30000 // max(1, len(df.columns))))
         df.to_sql(table, self.engine, if_exists="replace", index=False,
                   chunksize=chunk, method="multi")
-    def load_csv(self, source, table: str, chunksize: int = 200_000) -> int:
+    def load_csv(self, source, table: str, chunksize: int = 200_000, sep: str | None = None) -> int:
         """Быстрая потоковая загрузка CSV через COPY (для больших файлов).
 
         source: путь, bytes или файловый объект. Таблица пересоздаётся, вся загрузка в одной
         транзакции. Возвращает число загруженных строк.
         """
-        return load_csv_to_postgres(source, self.engine, table, chunksize)
+        return load_csv_to_postgres(source, self.engine, table, chunksize, sep)
+
+    def drop_table(self, table: str) -> None:
+        """Удаляет загруженную таблицу. Служебные `_bi_*` и несуществующие имена отклоняются."""
+        if table not in self.tables():
+            raise ValueError(f"Таблицы {table!r} нет среди загруженных данных")
+        with self.engine.begin() as c:
+            c.execute(text('DROP TABLE "' + table.replace('"', '""') + '"'))
 
     # --- запросы (только чтение) -----------------------------------------------
     def query(self, sql: str, max_rows: int | None = None) -> pd.DataFrame:

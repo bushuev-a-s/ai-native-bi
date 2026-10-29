@@ -64,6 +64,15 @@ def delete_chat(chat_id: int):
         new_chat()
 
 
+def drop_table(name: str):
+    try:
+        get_db().drop_table(name)
+        ss.agent = None                      # профиль и связи пересчитаются при следующей перерисовке
+        st.toast(f"Таблица «{name}» удалена")
+    except Exception as e:  # noqa: BLE001
+        st.toast(f"Не удалось удалить «{name}»: {str(e)[:100]}", icon="⚠️")
+
+
 def delete_dashboard(dash_id: int):
     get_db().delete_dashboard(dash_id)
 
@@ -166,21 +175,32 @@ with st.sidebar:
                        help="Удалить чат")
 
     st.divider()
+    SEP_CHOICES = {"Авто": None, "Запятая ( , )": ",", "Точка с запятой ( ; )": ";",
+                   "Табуляция": "\t", "Вертикальная черта ( | )": "|"}
+    sep_label = st.selectbox("Разделитель в CSV", list(SEP_CHOICES),
+                             help="Обычно определяется автоматически. Если таблица загрузилась «кашей» или с одной "
+                                  "колонкой, удалите её, выберите разделитель вручную и загрузите файл заново.")
     files = st.file_uploader("Загрузить CSV (сырые данные)", type=["csv"], accept_multiple_files=True)
     if files and st.button("Загрузить в базу", type="primary"):
-        done = []
+        done, warn = [], []
         for f in files:
             with st.spinner(f"Загружаю {f.name} ({f.size / 1024 / 1024:.1f} МБ)…"):
                 try:
-                    table, rows, method = load_file(db, f, f.name, size=f.size)
+                    table, rows, method = load_file(db, f, f.name, size=f.size, sep=SEP_CHOICES[sep_label])
                 except Exception as e:  # noqa: BLE001 — один плохой файл не должен останавливать остальные
                     st.error(f"{f.name}: не удалось загрузить — {str(e)[:200]}")
                     continue
-            done.append(f"• **{table}** — {rows:,} строк".replace(",", " ")
+            n_cols = len(db.columns(table))
+            done.append(f"• **{table}** — {rows:,}".replace(",", " ") + f" строк, колонок: {n_cols}"
                         + (" (быстрая загрузка COPY)" if method == "copy" else ""))
+            if n_cols == 1:
+                warn.append(f"«{table}»: всего одна колонка, возможно, разделитель определён неверно. "
+                            "Удалите таблицу, выберите разделитель вручную и загрузите файл заново.")
         if done:
             refresh_agent()
             st.success("Загружено:\n\n" + "\n".join(done))
+        for w in warn:
+            st.warning(w)
     if st.button("Обновить профиль данных"):
         refresh_agent()
     if st.button(" Обновить глубокий анализ"):
@@ -193,7 +213,12 @@ with st.sidebar:
         st.divider()
         st.caption("Таблицы в базе")
         for p in ss.agent.profiles:
-            st.write(f"• **{p['name']}** — {p['rows']:,} строк".replace(",", " "))
+            c_name, c_del = st.columns([5, 1])
+            c_name.write(f"• **{p['name']}** — {p['rows']:,} строк".replace(",", " "))
+            with c_del.popover("🗑"):
+                st.write(f"Удалить таблицу **{p['name']}** вместе с данными? Это нельзя отменить.")
+                st.button("Да, удалить", type="primary", key=f"tbl-del-{p['name']}",
+                          on_click=drop_table, args=(p["name"],))
 
 # ------------------------------------------------------------------ вкладки
 tab_chat, tab_dash = st.tabs(["💬 Чат с аналитиком", "📈 Дашборды"])

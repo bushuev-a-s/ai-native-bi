@@ -2,8 +2,10 @@
 import codecs
 import csv
 import io
+import itertools
 import os
 import re
+from collections import Counter
 import logging
 import warnings
 
@@ -26,13 +28,36 @@ def _decode(raw: bytes) -> str:
     return raw.decode("latin-1")
 
 
+SEPARATORS = ";,\t|"          # при равенстве баллов выигрывает тот, что раньше в списке
+
+
 def _sniff_sep(text: str) -> str:
-    sample = text[:20000]
-    try:
-        return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
-    except csv.Error:
-        first = sample.split("\n", 1)[0]
-        return max(",;\t|", key=first.count)
+    """Определяет разделитель по первым строкам файла.
+
+    Для каждого кандидата файл разбирается csv-парсером (кавычки учитываются), и считается, у какой доли
+    строк одинаковое число полей. Побеждает разделитель, дающий самую ровную таблицу, при равенстве
+    больше колонок. Так `;` с десятичной запятой (`1,5`) и запятые внутри текста не сбивают выбор.
+    Если ни один не даёт 2+ колонок (файл из одной колонки), возвращается запятая.
+    """
+    sample = text[:65536]
+    truncated = len(text) > len(sample)
+    best, best_key = ",", (0.0, 0)
+    for d in SEPARATORS:
+        try:
+            rows = [r for r in itertools.islice(csv.reader(io.StringIO(sample), delimiter=d), 300) if r]
+        except csv.Error:
+            continue
+        if truncated and len(rows) > 2:
+            rows = rows[:-1]                      # последняя строка выборки могла быть обрезана
+        if not rows:
+            continue
+        k, cnt = max(Counter(len(r) for r in rows).items(), key=lambda kv: (kv[1], kv[0]))
+        if k < 2:
+            continue
+        key = (round(cnt / len(rows), 3), k)
+        if key > best_key:
+            best, best_key = d, key
+    return best
 
 
 def clean_names(columns) -> list[str]:
@@ -84,8 +109,8 @@ def _try_dates(s: pd.Series) -> pd.Series:
     return s
 
 
-def read_csv_smart(source) -> pd.DataFrame:
-    """source: путь, bytes или файловый объект (st.file_uploader)."""
+def read_csv_smart(source, sep: str | None = None) -> pd.DataFrame:
+    """source: путь, bytes или файловый объект (st.file_uploader). sep: разделитель (None — определить сам)."""
     if isinstance(source, str):
         with open(source, "rb") as f:
             raw = f.read()
@@ -94,7 +119,7 @@ def read_csv_smart(source) -> pd.DataFrame:
     else:
         raw = source.read()
     text = _decode(raw)
-    sep = _sniff_sep(text)
+    sep = sep or _sniff_sep(text)
     df = pd.read_csv(io.StringIO(text), sep=sep, low_memory=False)
     return _clean_chunk(df)
 
@@ -265,7 +290,7 @@ def _detect_encoding(data) -> str:
     return "latin-1"
 
 
-def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000) -> int:
+def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000, sep: str | None = None) -> int:
     """Грузит большой CSV в Postgres через COPY кусками. Требует psycopg2.
 
     source: путь, bytes или файловый объект. Таблица пересоздаётся.
@@ -282,7 +307,7 @@ def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000) -
         raw = source if isinstance(source, bytes) else source.read()
         data, head = io.BytesIO(raw), raw[: 1 << 20]
     enc = _detect_encoding(data)
-    sep = _sniff_sep(head.decode(enc, errors="ignore"))
+    sep = sep or _sniff_sep(head.decode(enc, errors="ignore"))
     if hasattr(data, "seek"):
         data.seek(0)
 
@@ -317,11 +342,9 @@ def load_csv_to_postgres(source, engine, table: str, chunksize: int = 200_000) -
         conn.close()
     return total
 
-
 def load_file(db, source, filename: str, size: int | None = None,
-              threshold_mb: float | None = None) -> tuple[str, int, str]:
+              threshold_mb: float | None = None, sep: str | None = None) -> tuple[str, int, str]:
     """Грузит CSV в базу, выбирая способ по размеру файла.
-
     Файл от порога (FAST_LOAD_MIN_MB, по умолчанию 50 МБ) идёт потоково через COPY (`db.load_csv`),
     меньший — через pandas (`db.load_dataframe`). Возвращает (таблица, строк, "copy" | "dataframe").
     """
@@ -339,7 +362,8 @@ def load_file(db, source, filename: str, size: int | None = None,
     if hasattr(source, "seek"):
         source.seek(0)
     if size is not None and size >= limit:
-        return table, db.load_csv(source, table), "copy"
-    df = read_csv_smart(source)
+        kw = {"sep": sep} if sep else {}
+        return table, db.load_csv(source, table, **kw), "copy"
+    df = read_csv_smart(source, sep=sep)
     db.load_dataframe(df, table)
     return table, len(df), "dataframe"
