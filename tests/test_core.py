@@ -104,7 +104,8 @@ def test_unsafe_sql_from_llm_is_blocked_and_clarified():
 
 def test_clarify_and_reject_come_from_the_sql_step():
     agent, _ = _agent(["CLARIFY: За какой период показать?", "REJECT: Я не меняю данные."])
-    assert agent.ask("покажи динамику").text == "За какой период показать?"
+    r = agent.ask("пokажи динамику")
+    assert r.text == "За какой период показать?", r.text
     r = agent.ask("очисти таблицу")
     assert r.kind == "reject" and "не меняю" in r.text
 
