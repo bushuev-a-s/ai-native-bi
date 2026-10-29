@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Запускает ВСЕ тесты проекта (tests/test_*.py) и печатает итоговую сводку.
 #
-#   bash scripts/run_tests.sh                     все тесты
-#   bash scripts/run_tests.sh test_llm test_core  только перечисленные
-#   RUNNER="python3" bash scripts/run_tests.sh    свой запуск Python (по умолчанию: uv run python, иначе python3)
+#   bash run_tests.sh                     все тесты
+#   bash run_tests.sh test_llm test_core  только перечисленные
+#   RUNNER="python3" bash run_tests.sh    свой запуск Python (по умолчанию: uv run python, иначе python3)
 #
 # Windows: запускайте из Git Bash. Код возврата: 0 — всё прошло, 1 — есть упавшие.
 # Новые файлы tests/test_*.py подхватываются автоматически.

@@ -1,4 +1,6 @@
 """Streamlit-интерфейс: чат с агентом + вкладка с сохранёнными дашбордами."""
+import time
+
 import pandas as pd
 import streamlit as st
 
@@ -44,9 +46,10 @@ def render_chart(df: pd.DataFrame, spec: dict | None, key: str):
             st.dataframe(df, use_container_width=True)
 
 
-def render_dashboard(spec: dict, prefix: str):
+def render_dashboard(spec: dict, prefix: str, widgets: list | None = None):
     st.subheader(spec["title"])
-    widgets = execute_dashboard(db, spec)        # данные всегда свежие
+    # готовые данные из ответа агента или кеш (перерисовка страницы не должна заново гонять запросы по таблице)
+    widgets = widgets or execute_dashboard(db, spec)
     cols = st.columns(2)
     for i, w in enumerate(widgets):
         with cols[i % 2]:
@@ -63,7 +66,7 @@ def render_message(m: dict, idx: int):
     with st.chat_message(m["role"]):
         st.markdown(m["text"])
         if m.get("dashboard"):
-            render_dashboard(m["dashboard"], f"msg{idx}")
+            render_dashboard(m["dashboard"], f"msg{idx}", m.get("widgets"))
         if m.get("chart") is not None and m.get("df") is not None:
             render_chart(m["df"], m["chart"], f"msg{idx}-chart")
         if m.get("df") is not None and not m["df"].empty and not m.get("dashboard"):
@@ -72,6 +75,9 @@ def render_message(m: dict, idx: int):
         if m.get("sql"):
             with st.expander("Как посчитано (SQL)"):
                 st.code(m["sql"], language="sql")
+        if m.get("timing"):
+            t = m["timing"]
+            st.caption(f"⏱ {t['total_s']:.1f} с · вызовов модели: {t['llm_calls']} ({t['llm_s']:.1f} с) · БД: {t['db_s']:.1f} с")
         if m.get("analysis"):
             with st.expander("📊 Детальный анализ данных"):
                 a = m["analysis"]
@@ -111,8 +117,17 @@ with st.sidebar:
     files = st.file_uploader("Загрузить CSV (сырые данные)", type=["csv"], accept_multiple_files=True)
     if files and st.button("Загрузить в базу", type="primary"):
         for f in files:
+            name, t0 = table_name_from_file(f.name), time.perf_counter()
             with st.spinner(f"Загружаю {f.name}…"):
-                db.load_dataframe(read_csv_smart(f), table_name_from_file(f.name))
+                try:
+                    db.load_csv(f, name)               # быстрая загрузка через COPY
+                    how = "COPY"
+                except Exception as e:  # noqa: BLE001
+                    st.warning(f"Быстрая загрузка не удалась ({str(e)[:150]}), использую обычную.")
+                    f.seek(0)
+                    db.load_dataframe(read_csv_smart(f), name)
+                    how = "to_sql"
+            st.caption(f"{f.name}: {time.perf_counter() - t0:.0f} с ({how})")
         refresh_agent()
         st.success(f"Загружено файлов: {len(files)}")
     if st.button("Обновить профиль данных"):
@@ -155,7 +170,8 @@ with tab_chat:
             with st.spinner("Думаю…"):
                 res = ss.agent.ask(prompt, history)
             res_msg = {"role": "assistant", "text": res.text, "sql": res.sql, "df": res.df,
-                       "chart": res.chart, "dashboard": res.dashboard}
+                       "chart": res.chart, "dashboard": res.dashboard, "widgets": res.widgets,
+                       "timing": res.timing}
         ss.messages.append(res_msg)
         st.rerun()
 
