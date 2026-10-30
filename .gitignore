@@ -3,6 +3,7 @@ __pycache__/
 .env
 .env.example
 .venv/
+check.py
 # Данные организаторов в публичный репозиторий не кладём!
 data/
 private_data/
@@ -10,3 +11,5 @@ sample_data/
 *.sqlite
 *.diff
 *.zip
+*.patch
+*.txt
